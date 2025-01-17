@@ -3,6 +3,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import sqlite3
+import requests
+import os
 
 BOT_TOKEN = 'YOUR_TELEGRAM_BOT_API_KEY'
 API_KEY = 'YOUR_GEMINI_API_KEY'
@@ -14,11 +16,11 @@ cursor.execute('CREATE TABLE IF NOT EXISTS warnings(user_id int NOT NULL PRIMARY
 genai.configure(api_key=API_KEY)
 
 generation_config = {
-  "temperature": 2,
-  "top_p": 0.95,
-  "top_k": 64,
-  "max_output_tokens": 8192,
-  "response_mime_type": "text/plain",
+    "temperature": 1,
+    "top_p": 0.95,
+    "top_k": 40,
+    "max_output_tokens": 8192,
+    "response_mime_type": "text/plain",
 }
 
 model = genai.GenerativeModel(
@@ -45,19 +47,18 @@ def handle_response(text: str) -> str:
         HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
         HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE
-        })
+    })
     return response.text
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text: str = update.message.text
-
     chatid = update.message.chat_id
     userid = update.message.from_user.id
     messageid = update.message.message_id
 
     chat_admins = await update.effective_chat.get_administrators()
 
-    print(f'User ({userid}): {text}')
+    print(f'User  ({userid}): {text}')
     try:
         response: str = handle_response(text)
     except Exception as e:
@@ -72,7 +73,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             warningCount = cursor.fetchone()
 
             if warningCount is None:
-                warningCount = 0
+                warningCount = 0 
                 cursor.execute(f"INSERT INTO warnings (user_id, chat_id, warning) VALUES ({userid}, {chatid}, {warningCount + 1})")
             else:
                 warningCount = warningCount[0]
@@ -87,6 +88,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             print("Won't delete the message because the user is admin")
 
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_admins = await update.effective_chat.get_administrators()
+    chatid = update.message.chat_id
+    messageid = update.message.message_id
+    userid = update.message.from_user.id
+
+    if update.message.photo[-1]:
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+        file_path = os.path.join(os.getcwd(), photo.file_id + '.jpg')
+        await file.download_to_drive(file_path)
+    else:
+        await update.message.reply_text("Couldn't download the image.")
+    
+    sample_file = genai.upload_file(path=file_path, display_name="AdOrNot")
+    response = model.generate_content([sample_file, "In the provided image, you will see advertisements for Telegram groups. If you see any advertisement related content on the image, just type out 'Advertisement'. If you don't see any, type out 'Not'."])
+    if 'Advertisement' in response.text:
+        if update.effective_user not in (admin.user for admin in chat_admins):
+            await context.bot.delete_message(chat_id=chatid, message_id=messageid)
+            cursor.execute(f"SELECT warning FROM warnings WHERE user_id={userid} AND chat_id={chatid}")
+            warningCount = cursor.fetchone()
+
+            if warningCount is None:
+                warningCount = 0 
+                cursor.execute(f"INSERT INTO warnings (user_id, chat_id, warning) VALUES ({userid}, {chatid}, {warningCount + 1})")
+            else:
+                warningCount = warningCount[0]
+
+                if warningCount == 2:
+                    await context.bot.ban_chat_member(chat_id=chatid, user_id=userid)
+                    return
+                else:
+                    cursor.execute(f"UPDATE warnings SET warning = {warningCount + 1} WHERE user_id = {userid} AND chat_id={chatid}")
+
+            conn.commit()
+        else:
+            print("Won't delete the message because the user is admin")
+    os.remove(file_path)
+
 async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
     print(f'{context.error}')
 
@@ -95,6 +135,7 @@ if __name__ == '__main__':
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(MessageHandler(filters.TEXT, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_error_handler(error)
 
     print('Polling...')
